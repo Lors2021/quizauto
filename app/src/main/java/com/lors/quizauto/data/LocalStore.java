@@ -22,6 +22,8 @@ public final class LocalStore {
     private static final String KEY_CYCLES_LIMIT = "cycles_limit";
     private static final String FILE_NAME = "storage.json";
     private static final String UNKNOWN_FILE = "unknown.txt";
+    private static final String LOG_FILE = "log.txt";
+    private static final long LOG_MAX_BYTES = 500 * 1024; // 500 KB
 
     private LocalStore() {}
 
@@ -30,6 +32,9 @@ public final class LocalStore {
                 .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // storage.json (база вопросов)
+    // ─────────────────────────────────────────────────────────────
     public static void saveRaw(@NonNull Context ctx, @NonNull String json) throws IOException {
         File f = new File(ctx.getFilesDir(), FILE_NAME);
         try (FileOutputStream fos = new FileOutputStream(f)) {
@@ -73,16 +78,14 @@ public final class LocalStore {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Неизвестные вопросы — пишем в JSON-формате
+    // unknown.txt (неизвестные вопросы)
     // ─────────────────────────────────────────────────────────────
-
     public static synchronized void appendUnknown(@NonNull Context ctx,
                                                   @NonNull String question,
                                                   @NonNull List<String> variants) {
         try {
             File f = new File(ctx.getFilesDir(), UNKNOWN_FILE);
 
-            // Проверка на дубликат по нормализованному вопросу
             String existing = "";
             if (f.exists()) {
                 existing = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
@@ -91,15 +94,12 @@ public final class LocalStore {
             if (!norm.isEmpty()) {
                 String existingNorm = com.lors.quizauto.match.QuestionMatcher
                         .normalize(existing);
-                if (existingNorm.contains(norm)) {
-                    return; // уже записан
-                }
+                if (existingNorm.contains(norm)) return;
             }
 
             String time = new SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
                     .format(new Date());
 
-            // Экранируем кавычки и переносы строк
             String qEsc = escape(question);
             StringBuilder variantsJson = new StringBuilder();
             for (int i = 0; i < variants.size(); i++) {
@@ -141,6 +141,55 @@ public final class LocalStore {
 
     public static void clearUnknown(@NonNull Context ctx) {
         File f = new File(ctx.getFilesDir(), UNKNOWN_FILE);
+        if (f.exists()) f.delete();
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // log.txt (логи сервиса)
+    // ─────────────────────────────────────────────────────────────
+
+    /**
+     * Пишет строку в лог-файл. Ротация: если > 500 KB, обрезает первую половину.
+     */
+    public static synchronized void appendLog(@NonNull Context ctx, @NonNull String line) {
+        try {
+            File f = new File(ctx.getFilesDir(), LOG_FILE);
+
+            // Ротация
+            if (f.exists() && f.length() > LOG_MAX_BYTES) {
+                String data = new String(Files.readAllBytes(f.toPath()),
+                        StandardCharsets.UTF_8);
+                int half = data.length() / 2;
+                int nl = data.indexOf('\n', half);
+                if (nl > 0) data = data.substring(nl + 1);
+                try (FileOutputStream fos = new FileOutputStream(f)) {
+                    fos.write(data.getBytes(StandardCharsets.UTF_8));
+                }
+            }
+
+            String time = new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
+                    .format(new Date());
+            String out = time + "  " + line + "\n";
+
+            try (FileOutputStream fos = new FileOutputStream(f, true)) {
+                fos.write(out.getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (Exception ignored) {}
+    }
+
+    @NonNull
+    public static String loadLog(@NonNull Context ctx) {
+        File f = new File(ctx.getFilesDir(), LOG_FILE);
+        if (!f.exists()) return "";
+        try {
+            return new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    public static void clearLog(@NonNull Context ctx) {
+        File f = new File(ctx.getFilesDir(), LOG_FILE);
         if (f.exists()) f.delete();
     }
 }
