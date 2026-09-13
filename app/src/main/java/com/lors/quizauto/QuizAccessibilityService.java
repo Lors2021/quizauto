@@ -37,6 +37,16 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final long NEXT_SCAN_DELAY_MS = 200L;
     private static final long P2_COOLDOWN_MS = 800L;
 
+    // ⏱ Задержка перед первым кликом — даём викторине отрисовать варианты
+    private static final long FIRST_SEEN_TO_CLICK_MS = 450L;
+    // Через сколько считать вопрос "новым"
+    private static final long QUESTION_FRESH_MS = 3500L;
+    // Блокировка повтора ответа на тот же вопрос
+    private static final long ANSWER_COOLDOWN_MS = 3000L;
+
+    // Автоперезагрузка базы
+    private static final long BASE_RELOAD_INTERVAL_MS = 5000L;
+
     private static final double QUESTION_THRESHOLD = 0.80;
     private static final double SHORT_QUESTION_THRESHOLD = 0.68;
     private static final int SHORT_QUESTION_LEN = 25;
@@ -83,7 +93,23 @@ public class QuizAccessibilityService extends AccessibilityService {
     private String lastAnsweredQuestion = "";
     private long lastAnsweredTime = 0L;
 
+    // 🆕 Отслеживание "свежего" вопроса — чтобы не кликать сразу
+    private String currentQuestionId = "";
+    private long currentQuestionFirstSeen = 0L;
+
     private long lastNextClickTime = 0L;
+    private long lastBaseReloadTime = 0L;
+
+    private final Runnable baseReloader = new Runnable() {
+        @Override
+        public void run() {
+            if (!sRunning) return;
+            if (questions.isEmpty()) {
+                reloadQuestions();
+            }
+            handler.postDelayed(this, BASE_RELOAD_INTERVAL_MS);
+        }
+    };
 
     private void log(String msg) {
         Log.i(TAG, msg);
@@ -106,6 +132,10 @@ public class QuizAccessibilityService extends AccessibilityService {
         cyclesDone = 0;
         acquireWakeLock();
         log("Cycles limit: " + cyclesLimit);
+
+        // Автоперезагрузка базы, если она пустая
+        handler.removeCallbacks(baseReloader);
+        handler.postDelayed(baseReloader, BASE_RELOAD_INTERVAL_MS);
     }
 
     @Override
@@ -113,6 +143,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         sInstance = null;
         sRunning = false;
         handler.removeCallbacksAndMessages(null);
+        handler.removeCallbacks(baseReloader);
         releaseWakeLock();
         log("Service disconnected");
         return super.onUnbind(intent);
@@ -145,8 +176,11 @@ public class QuizAccessibilityService extends AccessibilityService {
         cyclesLimit = LocalStore.getCyclesLimit(this);
         lastSavedQuestionId = "";
         lastAnsweredQuestion = "";
+        currentQuestionId = "";
         lastNextClickTime = 0L;
         log("Cycles reset. Limit: " + cyclesLimit);
+        handler.removeCallbacks(baseReloader);
+        handler.postDelayed(baseReloader, BASE_RELOAD_INTERVAL_MS);
     }
 
     private void acquireWakeLock() {
@@ -195,6 +229,7 @@ public class QuizAccessibilityService extends AccessibilityService {
 
                 lastSavedQuestionId = "";
                 lastAnsweredQuestion = "";
+                currentQuestionId = "";
 
                 if (cyclesLimit > 0 && cyclesDone >= cyclesLimit) {
                     log("Cycle limit reached, stopping");
@@ -223,6 +258,8 @@ public class QuizAccessibilityService extends AccessibilityService {
                     lastNextClickTime = now;
                     if (smartClick(nextBtn)) {
                         log("P2: clicked Далее");
+                        // Сбрасываем "текущий вопрос" — новый будет другим
+                        currentQuestionId = "";
                         handler.postDelayed(() -> {
                             isProcessing = false;
                             handler.post(scanRunnable);
@@ -256,7 +293,33 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         String qId = QuestionMatcher.normalize(matched.getQuestion());
         long now = System.currentTimeMillis();
-        if (qId.equals(lastAnsweredQuestion) && (now - lastAnsweredTime) < 6000L) {
+
+        // 🆕 Отслеживаем "свежий вопрос" — не кликаем сразу после появления
+        if (!qId.equals(currentQuestionId)) {
+            // Первый раз видим этот вопрос
+            currentQuestionId = qId;
+            currentQuestionFirstSeen = now;
+            log("Fresh Q detected: " + matched.getQuestion());
+            // Не кликаем — подождём следующего скана
+            handler.postDelayed(() -> {
+                isProcessing = false;
+                handler.post(scanRunnable);
+            }, FIRST_SEEN_TO_CLICK_MS);
+            return;
+        }
+
+        // Если вопрос "свежий" — ждём, пока пройдёт FIRST_SEEN_TO_CLICK_MS
+        if (now - currentQuestionFirstSeen < FIRST_SEEN_TO_CLICK_MS) {
+            log("Q still fresh, waiting " + (FIRST_SEEN_TO_CLICK_MS - (now - currentQuestionFirstSeen)) + "ms");
+            handler.postDelayed(() -> {
+                isProcessing = false;
+                handler.post(scanRunnable);
+            }, FIRST_SEEN_TO_CLICK_MS - (now - currentQuestionFirstSeen) + 50L);
+            return;
+        }
+
+        // Анти-дубликат: если мы уже отвечали на этот вопрос в последние 3 сек — пропускаем
+        if (qId.equals(lastAnsweredQuestion) && (now - lastAnsweredTime) < ANSWER_COOLDOWN_MS) {
             return;
         }
 
@@ -325,8 +388,7 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         if (allTexts.isEmpty()) return;
 
-        // Ищем вопрос: сначала пробуем найти текст с "?"
-        // Если несколько — берём самый длинный
+        // 1) Ищем вопросы со знаком "?"
         String questionCandidate = null;
         for (String s : allTexts) {
             String norm = QuestionMatcher.normalize(s);
@@ -336,30 +398,17 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (norm.contains("загрузка")) continue;
             if (norm.contains("энерг")) continue;
             if (norm.contains("попытк")) continue;
-            // Только строки с "?" считаем вопросами
             if (!s.contains("?")) continue;
             if (questionCandidate == null || s.length() > questionCandidate.length()) {
                 questionCandidate = s;
             }
         }
 
-        // Если не нашли с "?" — берём самый длинный текст (запасной вариант)
+        // 2) Если вопроса с "?" нет — не сохраняем вообще.
+        //    Служебные строки типа "Выберите правильный ответ" — мусор.
         if (questionCandidate == null) {
-            for (String s : allTexts) {
-                String norm = QuestionMatcher.normalize(s);
-                if (UI_NOISE.contains(norm)) continue;
-                if (s.matches("^\\d+$")) continue;
-                if (s.length() < 8) continue;
-                if (norm.contains("загрузка")) continue;
-                if (norm.contains("энерг")) continue;
-                if (norm.contains("попытк")) continue;
-                if (questionCandidate == null || s.length() > questionCandidate.length()) {
-                    questionCandidate = s;
-                }
-            }
+            return;
         }
-
-        if (questionCandidate == null) return;
 
         String qId = QuestionMatcher.normalize(questionCandidate);
         long now = System.currentTimeMillis();
@@ -506,9 +555,6 @@ public class QuizAccessibilityService extends AccessibilityService {
         return null;
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // ЖЕЛЕЗОБЕТОННЫЙ КЛИК: всегда через gesture по координатам
-    // ─────────────────────────────────────────────────────────────
     private boolean smartClick(@NonNull AccessibilityNodeInfo node) {
         CharSequence cs = node.getText();
         if (cs != null && NEVER_CLICK.contains(QuestionMatcher.normalize(cs.toString()))) {
@@ -516,13 +562,9 @@ public class QuizAccessibilityService extends AccessibilityService {
             return false;
         }
 
-        // 1) Пытаемся найти координаты кликабельного элемента
         Rect rect = new Rect();
-
-        // Сначала пробуем boundsInScreen самого узла
         node.getBoundsInScreen(rect);
         if (rect.width() <= 0 || rect.height() <= 0) {
-            // Если узел невидим — идём к родителям
             AccessibilityNodeInfo cur = node.getParent();
             int depth = 0;
             while (cur != null && depth < 6) {
@@ -533,8 +575,7 @@ public class QuizAccessibilityService extends AccessibilityService {
             }
         }
 
-        if (rect.width() <= 0 || rect.height() > 0) {
-            // Пробуем performAction как последний шанс
+        if (rect.width() <= 0 || rect.height() <= 0) {
             AccessibilityNodeInfo cur = node;
             int depth = 0;
             while (cur != null && depth < 6) {
@@ -549,12 +590,10 @@ public class QuizAccessibilityService extends AccessibilityService {
             return false;
         }
 
-        // 2) Всегда кликаем по координатам
         float x = rect.exactCenterX();
         float y = rect.exactCenterY();
         boolean ok = tapAt(x, y);
 
-        // 3) Если gesture не сработал — пробуем performAction как запасной вариант
         if (!ok) {
             AccessibilityNodeInfo cur = node;
             int depth = 0;
@@ -568,7 +607,6 @@ public class QuizAccessibilityService extends AccessibilityService {
                 depth++;
             }
         }
-
         return ok;
     }
 
