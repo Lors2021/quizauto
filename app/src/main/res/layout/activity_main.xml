@@ -129,6 +129,14 @@
             android:text="Показать неизвестные вопросы" />
 
         <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnLog"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Показать логи сервиса" />
+
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnOverlaySettings"
             style="@style/Widget.Material3.Button.OutlinedButton"
             android:layout_width="match_parent"
