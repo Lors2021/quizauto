@@ -60,5 +60,78 @@ public class OverlayService extends Service {
 
         params = new WindowManager.LayoutParams(
                 size, size, type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-        
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        params.gravity = Gravity.TOP | Gravity.START;
+        params.x = dp(16);
+        params.y = dp(120);
+
+        root.setOnTouchListener(new View.OnTouchListener() {
+            int startX, startY;
+            float touchX, touchY;
+            boolean moved;
+            final int slop = dp(6);
+
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        startX = params.x; startY = params.y;
+                        touchX = e.getRawX(); touchY = e.getRawY();
+                        moved = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        int dx = (int) (e.getRawX() - touchX);
+                        int dy = (int) (e.getRawY() - touchY);
+                        if (Math.abs(dx) > slop || Math.abs(dy) > slop) moved = true;
+                        params.x = startX + dx;
+                        params.y = startY + dy;
+                        wm.updateViewLayout(bubble, params);
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        if (!moved) toggle();
+                        return true;
+                }
+                return false;
+            }
+        });
+
+        wm.addView(root, params);
+    }
+
+    private void toggle() {
+        active = !active;
+        QuizAccessibilityService.setRunning(active);
+
+        GradientDrawable bg = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                active
+                        ? new int[]{0xFF66BB6A, 0xFF4CAF50}
+                        : new int[]{0xFFF44336, 0xFFD32F2F});
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setStroke(dp(3), Color.WHITE);
+        bubble.setBackground(bg);
+
+        Toast.makeText(this, active ? "QuizAuto: СТАРТ" : "QuizAuto: СТОП",
+                Toast.LENGTH_SHORT).show();
+    }
+
+    private int dp(int v) {
+        return Math.round(getResources().getDisplayMetrics().density * v);
+    }
+
+    @Override
+    public void onDestroy() {
+        sRunning = false;
+        QuizAccessibilityService.setRunning(false);
+        if (bubble != null && wm != null) {
+            wm.removeView(bubble);
+            bubble = null;
+        }
+        super.onDestroy();
+    }
+
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) { return null; }
+}
