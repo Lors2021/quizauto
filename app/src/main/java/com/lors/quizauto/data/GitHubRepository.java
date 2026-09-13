@@ -28,7 +28,7 @@ public final class GitHubRepository {
     // ⚠️ ЗАМЕНИ НА СВОЮ ССЫЛКУ ⚠️
     // Пример: https://raw.githubusercontent.com/username/quizauto/main/questions.json
     public static final String RAW_URL =
-            "https://raw.githubusercontent.com/Lors2021/quizauto/refs/heads/main/app/src/main/java/com/lors/quizauto/data/GitHubRepository.java";
+            "https://raw.githubusercontent.com/Lors2021/quizauto/refs/heads/main/questions.json";
 
     private static final OkHttpClient CLIENT = new OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
