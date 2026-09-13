@@ -40,9 +40,11 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final long FIRST_SEEN_TO_CLICK_MS = 450L;
     private static final long ANSWER_COOLDOWN_MS = 3000L;
     private static final long BASE_RELOAD_INTERVAL_MS = 5000L;
+    private static final long HEARTBEAT_INTERVAL_MS = 700L;
 
-    // 🆕 Не чаще раза в 1.2 сек писать диагностику "неизвестного экрана"
-    private static final long UNKNOWN_SCREEN_LOG_COOLDOWN_MS = 1200L;
+    // 🆕 Диагностика "застоя" — если на одном экране > 2.5 сек — пишем, что там
+    private static final long STUCK_THRESHOLD_MS = 2500L;
+    private static final long STUCK_LOG_COOLDOWN_MS = 3000L;
 
     private static final double QUESTION_THRESHOLD = 0.80;
     private static final double SHORT_QUESTION_THRESHOLD = 0.68;
@@ -94,8 +96,11 @@ public class QuizAccessibilityService extends AccessibilityService {
     private long currentQuestionFirstSeen = 0L;
 
     private long lastNextClickTime = 0L;
-    private long lastBaseReloadTime = 0L;
-    private long lastUnknownScreenLog = 0L;
+
+    // 🆕 Отслеживание "застоя" — последний виденный набор текстов + время
+    private String lastScreenSignature = "";
+    private long lastScreenChangeTime = 0L;
+    private long lastStuckLogTime = 0L;
 
     private final Runnable baseReloader = new Runnable() {
         @Override
@@ -103,6 +108,18 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (!sRunning) return;
             if (questions.isEmpty()) reloadQuestions();
             handler.postDelayed(this, BASE_RELOAD_INTERVAL_MS);
+        }
+    };
+
+    private final Runnable heartbeat = new Runnable() {
+        @Override
+        public void run() {
+            if (!sRunning) return;
+            if (!isProcessing) {
+                handler.removeCallbacks(scanRunnable);
+                handler.post(scanRunnable);
+            }
+            handler.postDelayed(this, HEARTBEAT_INTERVAL_MS);
         }
     };
 
@@ -137,6 +154,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         sRunning = false;
         handler.removeCallbacksAndMessages(null);
         handler.removeCallbacks(baseReloader);
+        handler.removeCallbacks(heartbeat);
         releaseWakeLock();
         log("Service disconnected");
         return super.onUnbind(intent);
@@ -171,9 +189,12 @@ public class QuizAccessibilityService extends AccessibilityService {
         lastAnsweredQuestion = "";
         currentQuestionId = "";
         lastNextClickTime = 0L;
+        lastScreenSignature = "";
         log("Cycles reset. Limit: " + cyclesLimit);
         handler.removeCallbacks(baseReloader);
         handler.postDelayed(baseReloader, BASE_RELOAD_INTERVAL_MS);
+        handler.removeCallbacks(heartbeat);
+        handler.postDelayed(heartbeat, HEARTBEAT_INTERVAL_MS);
     }
 
     private void acquireWakeLock() {
@@ -212,6 +233,10 @@ public class QuizAccessibilityService extends AccessibilityService {
             List<AccessibilityNodeInfo> nodes = new ArrayList<>();
             collectNodes(root, nodes);
 
+            // 🆕 Диагностика "застоя": если тексты не меняются дольше STUCK_THRESHOLD_MS —
+            //     пишем что видим, вне зависимости от того, что решит state machine
+            maybeLogStuckScreen(nodes);
+
             // P1: победа
             AccessibilityNodeInfo restartBtn = findFirstByText(nodes, 0.85,
                     "Новая игра", "Заново", "Играть заново");
@@ -230,6 +255,7 @@ public class QuizAccessibilityService extends AccessibilityService {
                     handler.post(() -> {
                         sRunning = false;
                         cyclesDone = 0;
+                        handler.removeCallbacks(heartbeat);
                         releaseWakeLock();
                         Toast.makeText(
                                 QuizAccessibilityService.this,
@@ -262,13 +288,7 @@ public class QuizAccessibilityService extends AccessibilityService {
             }
 
             // P3: экран вопроса
-            boolean handled = handleQuestionScreen(nodes);
-
-            // 🆕 Диагностика: если ни P1, ни P2, ни P3 не сработали —
-            //     пишем, что видим на экране
-            if (!handled) {
-                logUnknownScreen(nodes);
-            }
+            handleQuestionScreen(nodes);
 
         } finally {
             handler.postDelayed(() -> isProcessing = false, 100L);
@@ -276,14 +296,10 @@ public class QuizAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * 🆕 Диагностика: пишет тексты на экране, когда ничего не сработало.
-     * Пишется не чаще раза в UNKNOWN_SCREEN_LOG_COOLDOWN_MS.
+     * 🆕 Если экран не меняется дольше STUCK_THRESHOLD_MS — пишем подробный дамп.
+     * Это позволяет понять, что происходит когда сервис "стоит" на вопросе.
      */
-    private void logUnknownScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
-        long now = System.currentTimeMillis();
-        if (now - lastUnknownScreenLog < UNKNOWN_SCREEN_LOG_COOLDOWN_MS) return;
-        lastUnknownScreenLog = now;
-
+    private void maybeLogStuckScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
         List<String> texts = new ArrayList<>();
         for (AccessibilityNodeInfo n : nodes) {
             CharSequence cs = n.getText();
@@ -291,32 +307,66 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (cs == null) continue;
             String s = cs.toString().trim();
             if (s.isEmpty()) continue;
-            if (s.length() > 80) s = s.substring(0, 80) + "…";
+            if (s.length() > 100) s = s.substring(0, 100) + "…";
             if (!texts.contains(s)) texts.add(s);
         }
-        log("UNKNOWN SCREEN. Texts: " + texts);
+
+        if (texts.isEmpty()) return;
+
+        String signature = String.join("|", texts);
+        long now = System.currentTimeMillis();
+
+        if (!signature.equals(lastScreenSignature)) {
+            lastScreenSignature = signature;
+            lastScreenChangeTime = now;
+            return;
+        }
+
+        // Экран не менялся
+        long stuckFor = now - lastScreenChangeTime;
+        if (stuckFor < STUCK_THRESHOLD_MS) return;
+        if (now - lastStuckLogTime < STUCK_LOG_COOLDOWN_MS) return;
+
+        lastStuckLogTime = now;
+
+        // Диагностика: какие вопросы из базы близки к текстам на экране?
+        List<String> nearMatches = new ArrayList<>();
+        for (String s : texts) {
+            if (s.length() < 8 || s.length() > 300) continue;
+            String norm = QuestionMatcher.normalize(s);
+            if (UI_NOISE.contains(norm)) continue;
+
+            for (Question q : questions) {
+                double sim = QuestionMatcher.similarity(s, q.getQuestion());
+                if (sim >= 0.60) {
+                    nearMatches.add(String.format("[%.2f] \"%s\" ~ \"%s\"",
+                            sim, s, q.getQuestion()));
+                }
+            }
+        }
+
+        log("STUCK " + (stuckFor / 1000) + "s. Texts: " + texts);
+        if (!nearMatches.isEmpty()) {
+            log("STUCK near-matches: " + nearMatches);
+        } else {
+            log("STUCK: no near-matches in base. Have you added this Q?");
+        }
     }
 
-    /**
-     * Возвращает true, если экран был распознан как экран вопроса
-     * (неважно — ответили или нет).
-     */
-    private boolean handleQuestionScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
+    private void handleQuestionScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
         if (questions.isEmpty()) {
             reloadQuestions();
-            if (questions.isEmpty()) return false;
+            if (questions.isEmpty()) return;
         }
 
         List<String> visibleAnswers = collectVisibleAnswers(nodes);
         Question matched = findBestQuestionMatch(nodes, visibleAnswers);
 
         if (matched == null) {
-            // Если видим признаки экрана вопроса, но матч не удался — сохраняем
             if (visibleAnswers.size() >= 2) {
                 saveUnknownQuestion(nodes);
-                return true; // был экран вопроса, просто неизвестный
             }
-            return false;
+            return;
         }
 
         String qId = QuestionMatcher.normalize(matched.getQuestion());
@@ -330,7 +380,7 @@ public class QuizAccessibilityService extends AccessibilityService {
                 isProcessing = false;
                 handler.post(scanRunnable);
             }, FIRST_SEEN_TO_CLICK_MS);
-            return true;
+            return;
         }
 
         if (now - currentQuestionFirstSeen < FIRST_SEEN_TO_CLICK_MS) {
@@ -339,11 +389,11 @@ public class QuizAccessibilityService extends AccessibilityService {
                 isProcessing = false;
                 handler.post(scanRunnable);
             }, FIRST_SEEN_TO_CLICK_MS - (now - currentQuestionFirstSeen) + 50L);
-            return true;
+            return;
         }
 
         if (qId.equals(lastAnsweredQuestion) && (now - lastAnsweredTime) < ANSWER_COOLDOWN_MS) {
-            return true;
+            return;
         }
 
         log("Matched Q: " + matched.getQuestion());
@@ -352,12 +402,12 @@ public class QuizAccessibilityService extends AccessibilityService {
         if (answerNode == null) {
             logW("Answer node not found: " + matched.getAnswer()
                     + " | visible: " + visibleAnswers);
-            return true;
+            return;
         }
 
         if (!smartClick(answerNode)) {
             logW("Failed to click answer");
-            return true;
+            return;
         }
 
         lastAnsweredQuestion = qId;
@@ -365,7 +415,6 @@ public class QuizAccessibilityService extends AccessibilityService {
         log("Clicked answer: " + matched.getAnswer());
 
         clickCheckWithRetry(0);
-        return true;
     }
 
     private void clickCheckWithRetry(int attempt) {
@@ -645,6 +694,7 @@ public class QuizAccessibilityService extends AccessibilityService {
                 sInstance.acquireWakeLock();
             } else {
                 sInstance.releaseWakeLock();
+                sInstance.handler.removeCallbacks(sInstance.heartbeat);
             }
         }
     }
