@@ -1,1 +1,4 @@
-
+<resources>
+    <string name="app_name">QuizAuto</string>
+    <string name="accessibility_description">Автоматически отвечает на вопросы викторины Билим Класс, используя базу с GitHub.</string>
+</resources>
