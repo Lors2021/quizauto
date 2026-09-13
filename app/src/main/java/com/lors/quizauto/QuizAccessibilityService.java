@@ -66,6 +66,9 @@ public class QuizAccessibilityService extends AccessibilityService {
 
     private PowerManager.WakeLock wakeLock;
 
+    // Чтобы не записывать один и тот же неизвестный вопрос много раз подряд
+    private String lastUnknownSaved = "";
+
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
@@ -113,9 +116,6 @@ public class QuizAccessibilityService extends AccessibilityService {
         Log.i(TAG, "Cycles reset. Limit: " + cyclesLimit);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // WakeLock — не гасим экран
-    // ─────────────────────────────────────────────────────────────
     private void acquireWakeLock() {
         try {
             PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
@@ -125,8 +125,7 @@ public class QuizAccessibilityService extends AccessibilityService {
                             | PowerManager.ON_AFTER_RELEASE,
                     "QuizAuto::screenWake");
             wakeLock.setReferenceCounted(false);
-            wakeLock.acquire(4 * 60 * 60 * 1000L); // 4 часа максимум
-            Log.i(TAG, "WakeLock acquired");
+            wakeLock.acquire(4 * 60 * 60 * 1000L);
         } catch (Exception e) {
             Log.w(TAG, "WakeLock failed: " + e.getMessage());
         }
@@ -136,20 +135,11 @@ public class QuizAccessibilityService extends AccessibilityService {
         try {
             if (wakeLock != null && wakeLock.isHeld()) {
                 wakeLock.release();
-                Log.i(TAG, "WakeLock released");
             }
         } catch (Exception ignored) {}
         wakeLock = null;
     }
 
-    private void updateWakeLock() {
-        if (sRunning) acquireWakeLock();
-        else releaseWakeLock();
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // STATE MACHINE
-    // ─────────────────────────────────────────────────────────────
     private void runStateMachine() {
         if (!sRunning || isProcessing) return;
         AccessibilityNodeInfo root = getRootInActiveWindow();
@@ -223,8 +213,11 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         List<String> visibleAnswers = collectVisibleAnswers(nodes);
         Question matched = findBestQuestionMatch(nodes, visibleAnswers);
+
         if (matched == null) {
-            Log.d(TAG, "No question match");
+            // 🆕 Сохраняем неизвестный вопрос
+            saveUnknownQuestion(nodes, visibleAnswers);
+            Log.d(TAG, "No question match — saved to unknown");
             return;
         }
         Log.i(TAG, "Matched Q: " + matched.getQuestion());
@@ -254,6 +247,43 @@ public class QuizAccessibilityService extends AccessibilityService {
                 Log.w(TAG, "Проверить not found or disabled");
             }
         }, ACTION_DELAY_MS);
+    }
+
+    /**
+     * 🆕 Сохраняем неизвестный вопрос и его варианты.
+     * Ищем самый длинный текстовый узел (это и будет вопрос).
+     */
+    private void saveUnknownQuestion(@NonNull List<AccessibilityNodeInfo> nodes,
+                                     @NonNull List<String> visibleAnswers) {
+        if (visibleAnswers.size() < 2) return; // не похоже на экран вопроса
+
+        // Ищем вопрос — самый длинный текст, не входящий в UI_NOISE и не вариант ответа
+        String questionCandidate = null;
+        for (AccessibilityNodeInfo n : nodes) {
+            CharSequence cs = n.getText();
+            if (cs == null) continue;
+            String s = cs.toString().trim();
+            if (s.length() < 10 || s.length() > 300) continue;
+            String norm = QuestionMatcher.normalize(s);
+            if (UI_NOISE.contains(norm)) continue;
+            if (s.matches("\\d+")) continue;
+            if (visibleAnswers.contains(s)) continue; // это вариант ответа, не вопрос
+
+            if (questionCandidate == null || s.length() > questionCandidate.length()) {
+                questionCandidate = s;
+            }
+        }
+
+        if (questionCandidate == null) return;
+
+        // Защита от повторной записи
+        String normQ = QuestionMatcher.normalize(questionCandidate);
+        if (normQ.equals(lastUnknownSaved)) return;
+        lastUnknownSaved = normQ;
+
+        LocalStore.appendUnknown(this, questionCandidate, visibleAnswers);
+        Log.i(TAG, "Saved unknown Q: " + questionCandidate
+                + " | variants: " + visibleAnswers.size());
     }
 
     @NonNull
