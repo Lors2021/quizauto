@@ -66,8 +66,9 @@ public class QuizAccessibilityService extends AccessibilityService {
 
     private PowerManager.WakeLock wakeLock;
 
-    // Чтобы не записывать один и тот же неизвестный вопрос много раз подряд
-    private String lastUnknownSaved = "";
+    // ID последнего записанного вопроса — чтобы не дублировать в одном показе
+    private String lastSavedQuestionId = "";
+    private long lastSavedQuestionTime = 0L;
 
     @Override
     protected void onServiceConnected() {
@@ -113,6 +114,7 @@ public class QuizAccessibilityService extends AccessibilityService {
     public void resetCycles() {
         cyclesDone = 0;
         cyclesLimit = LocalStore.getCyclesLimit(this);
+        lastSavedQuestionId = "";
         Log.i(TAG, "Cycles reset. Limit: " + cyclesLimit);
     }
 
@@ -157,6 +159,9 @@ public class QuizAccessibilityService extends AccessibilityService {
                 cyclesDone++;
                 Log.i(TAG, "P1: cycle done. Total: " + cyclesDone
                         + (cyclesLimit > 0 ? "/" + cyclesLimit : " (∞)"));
+
+                // Сбрасываем защиту от дубликата — новый цикл
+                lastSavedQuestionId = "";
 
                 if (cyclesLimit > 0 && cyclesDone >= cyclesLimit) {
                     Log.i(TAG, "Cycle limit reached, stopping");
@@ -208,16 +213,20 @@ public class QuizAccessibilityService extends AccessibilityService {
     private void handleQuestionScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
         if (questions.isEmpty()) {
             reloadQuestions();
-            if (questions.isEmpty()) return;
+            if (questions.isEmpty()) {
+                Log.w(TAG, "No questions loaded, cannot match. Did you sync?");
+                // Всё равно попробуем сохранить вопрос — база может быть пустой
+                saveUnknownQuestion(nodes);
+                return;
+            }
         }
 
         List<String> visibleAnswers = collectVisibleAnswers(nodes);
         Question matched = findBestQuestionMatch(nodes, visibleAnswers);
 
         if (matched == null) {
-            // 🆕 Сохраняем неизвестный вопрос
-            saveUnknownQuestion(nodes, visibleAnswers);
-            Log.d(TAG, "No question match — saved to unknown");
+            Log.i(TAG, "No question match — trying to save unknown");
+            saveUnknownQuestion(nodes);
             return;
         }
         Log.i(TAG, "Matched Q: " + matched.getQuestion());
@@ -249,41 +258,73 @@ public class QuizAccessibilityService extends AccessibilityService {
         }, ACTION_DELAY_MS);
     }
 
-    /**
-     * 🆕 Сохраняем неизвестный вопрос и его варианты.
-     * Ищем самый длинный текстовый узел (это и будет вопрос).
-     */
-    private void saveUnknownQuestion(@NonNull List<AccessibilityNodeInfo> nodes,
-                                     @NonNull List<String> visibleAnswers) {
-        if (visibleAnswers.size() < 2) return; // не похоже на экран вопроса
-
-        // Ищем вопрос — самый длинный текст, не входящий в UI_NOISE и не вариант ответа
-        String questionCandidate = null;
+    // ─────────────────────────────────────────────────────────────
+    // СБОР НЕИЗВЕСТНЫХ ВОПРОСОВ (упрощённая, агрессивная версия)
+    // ─────────────────────────────────────────────────────────────
+    private void saveUnknownQuestion(@NonNull List<AccessibilityNodeInfo> nodes) {
+        // 1) Собираем ВСЕ тексты с экрана
+        List<String> allTexts = new ArrayList<>();
         for (AccessibilityNodeInfo n : nodes) {
             CharSequence cs = n.getText();
+            if (cs == null) cs = n.getContentDescription();
             if (cs == null) continue;
             String s = cs.toString().trim();
-            if (s.length() < 10 || s.length() > 300) continue;
-            String norm = QuestionMatcher.normalize(s);
-            if (UI_NOISE.contains(norm)) continue;
-            if (s.matches("\\d+")) continue;
-            if (visibleAnswers.contains(s)) continue; // это вариант ответа, не вопрос
+            if (s.isEmpty()) continue;
+            if (s.length() > 400) continue;
+            allTexts.add(s);
+        }
 
+        Log.d(TAG, "saveUnknown: total texts on screen = " + allTexts.size());
+
+        if (allTexts.isEmpty()) {
+            Log.w(TAG, "saveUnknown: no texts on screen, skip");
+            return;
+        }
+
+        // 2) Ищем самый длинный текст — это вопрос
+        //    Не фильтруем по UI_NOISE — пусть попадёт что угодно.
+        String questionCandidate = null;
+        for (String s : allTexts) {
+            String norm = QuestionMatcher.normalize(s);
+            if (UI_NOISE.contains(norm)) continue; // служебные — мимо
+            if (s.matches("^\\d+$")) continue;     // "27", "180"
+            if (s.length() < 8) continue;          // слишком короткое
             if (questionCandidate == null || s.length() > questionCandidate.length()) {
                 questionCandidate = s;
             }
         }
 
-        if (questionCandidate == null) return;
+        if (questionCandidate == null) {
+            Log.w(TAG, "saveUnknown: no question candidate found");
+            return;
+        }
 
-        // Защита от повторной записи
-        String normQ = QuestionMatcher.normalize(questionCandidate);
-        if (normQ.equals(lastUnknownSaved)) return;
-        lastUnknownSaved = normQ;
+        // 3) Защита от дубликата (один и тот же вопрос не сохраняем в течение 5 сек)
+        String qId = QuestionMatcher.normalize(questionCandidate);
+        long now = System.currentTimeMillis();
+        if (qId.equals(lastSavedQuestionId) && (now - lastSavedQuestionTime) < 5000L) {
+            Log.d(TAG, "saveUnknown: duplicate within 5s, skip");
+            return;
+        }
+        lastSavedQuestionId = qId;
+        lastSavedQuestionTime = now;
 
-        LocalStore.appendUnknown(this, questionCandidate, visibleAnswers);
-        Log.i(TAG, "Saved unknown Q: " + questionCandidate
-                + " | variants: " + visibleAnswers.size());
+        // 4) Собираем варианты — все тексты, кроме вопроса и служебных
+        List<String> variants = new ArrayList<>();
+        for (String s : allTexts) {
+            if (s.equals(questionCandidate)) continue;
+            String norm = QuestionMatcher.normalize(s);
+            if (UI_NOISE.contains(norm)) continue;
+            if (s.matches("^\\d+$")) continue;
+            if (s.length() > 100) continue;
+            if (!variants.contains(s)) variants.add(s);
+        }
+
+        Log.i(TAG, "SAVING UNKNOWN: Q=\"" + questionCandidate
+                + "\" | variants=" + variants.size());
+
+        // 5) Пишем в файл
+        LocalStore.appendUnknown(this, questionCandidate, variants);
     }
 
     @NonNull
