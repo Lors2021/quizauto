@@ -73,46 +73,59 @@ public final class LocalStore {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Режим «собирать неизвестные»
+    // Неизвестные вопросы — пишем в JSON-формате
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Добавляет неизвестный вопрос в файл unknown.txt.
-     * Не пишет дубликаты (по нормализованному тексту вопроса).
-     */
     public static synchronized void appendUnknown(@NonNull Context ctx,
                                                   @NonNull String question,
                                                   @NonNull List<String> variants) {
         try {
             File f = new File(ctx.getFilesDir(), UNKNOWN_FILE);
 
-            // Проверка на дубликат
+            // Проверка на дубликат по нормализованному вопросу
             String existing = "";
             if (f.exists()) {
                 existing = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
             }
             String norm = com.lors.quizauto.match.QuestionMatcher.normalize(question);
-            String existingNorm = com.lors.quizauto.match.QuestionMatcher.normalize(existing);
-            if (!norm.isEmpty() && existingNorm.contains(norm)) {
-                return; // уже собирали
+            if (!norm.isEmpty()) {
+                String existingNorm = com.lors.quizauto.match.QuestionMatcher
+                        .normalize(existing);
+                if (existingNorm.contains(norm)) {
+                    return; // уже записан
+                }
             }
 
             String time = new SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
                     .format(new Date());
 
-            StringBuilder sb = new StringBuilder();
-            sb.append("=== ").append(time).append(" ===\n");
-            sb.append("ВОПРОС: ").append(question).append("\n");
-            sb.append("ВАРИАНТЫ:\n");
-            for (String v : variants) {
-                sb.append("  - ").append(v).append("\n");
+            // Экранируем кавычки и переносы строк
+            String qEsc = escape(question);
+            StringBuilder variantsJson = new StringBuilder();
+            for (int i = 0; i < variants.size(); i++) {
+                if (i > 0) variantsJson.append(", ");
+                variantsJson.append("\"").append(escape(variants.get(i))).append("\"");
             }
-            sb.append("\n");
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("// ").append(time).append("\n");
+            sb.append("// Варианты на экране: [")
+                    .append(variantsJson).append("]\n");
+            sb.append("{ \"question\": \"").append(qEsc)
+                    .append("\", \"answer\": \"\" },\n\n");
 
             try (FileOutputStream fos = new FileOutputStream(f, true)) {
                 fos.write(sb.toString().getBytes(StandardCharsets.UTF_8));
             }
         } catch (Exception ignored) {}
+    }
+
+    private static String escape(String s) {
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", " ")
+                .replace("\r", " ")
+                .trim();
     }
 
     @NonNull
