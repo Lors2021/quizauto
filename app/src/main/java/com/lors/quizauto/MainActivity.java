@@ -64,12 +64,14 @@ public class MainActivity extends AppCompatActivity {
         MaterialButton btnAccessSettings = findViewById(R.id.btnAccessSettings);
         MaterialButton btnToggleOverlay = findViewById(R.id.btnToggleOverlay);
         MaterialButton btnUnknown = findViewById(R.id.btnUnknown);
+        MaterialButton btnLog = findViewById(R.id.btnLog);
 
         btnSync.setOnClickListener(v -> syncFromGithub());
         btnOverlaySettings.setOnClickListener(v -> openOverlayPermission());
         btnAccessSettings.setOnClickListener(v -> openAccessibilitySettings());
         btnToggleOverlay.setOnClickListener(v -> toggleOverlay());
         btnUnknown.setOnClickListener(v -> showUnknown());
+        btnLog.setOnClickListener(v -> showLog());
 
         cardOverlay.setOnClickListener(v -> openOverlayPermission());
         cardAccessibility.setOnClickListener(v -> openAccessibilitySettings());
@@ -195,7 +197,7 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    // 🆕 Показать неизвестные вопросы
+    // Неизвестные вопросы
     private void showUnknown() {
         String data = LocalStore.loadUnknown(this);
         if (data.isEmpty()) {
@@ -203,7 +205,6 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // Скроллируемое поле с текстом
         ScrollView scroll = new ScrollView(this);
         TextView tv = new TextView(this);
         tv.setText(data);
@@ -230,12 +231,51 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
+    // Логи
+    private void showLog() {
+        String data = LocalStore.loadLog(this);
+        if (data.isEmpty()) {
+            Toast.makeText(this, "Логи пусты", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        ScrollView scroll = new ScrollView(this);
+        TextView tv = new TextView(this);
+        // Показываем последние 5000 символов, чтобы не тормозило
+        String preview = data.length() > 5000
+                ? "…(начало опущено)…\n\n" + data.substring(data.length() - 5000)
+                : data;
+        tv.setText(preview);
+        tv.setTextSize(11);
+        tv.setTypeface(android.graphics.Typeface.MONOSPACE);
+        tv.setPadding(32, 32, 32, 32);
+        tv.setTextIsSelectable(true);
+        scroll.addView(tv);
+
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("Логи сервиса (" + data.length() + " симв.)")
+                .setView(scroll)
+                .setPositiveButton("Копировать всё", (d, w) -> {
+                    ClipboardManager cm = (ClipboardManager)
+                            getSystemService(Context.CLIPBOARD_SERVICE);
+                    cm.setPrimaryClip(ClipData.newPlainText("log", data));
+                    Toast.makeText(this, "Все логи скопированы",
+                            Toast.LENGTH_SHORT).show();
+                })
+                .setNeutralButton("Очистить", (d, w) -> {
+                    LocalStore.clearLog(this);
+                    Toast.makeText(this, "Логи очищены", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Закрыть", null)
+                .show();
+    }
+
     private int countRecords(String data) {
         int count = 0;
         int idx = 0;
-        while ((idx = data.indexOf("ВОПРОС:", idx)) != -1) {
+        while ((idx = data.indexOf("\"question\"", idx)) != -1) {
             count++;
-            idx += 7;
+            idx += 10;
         }
         return count;
     }
