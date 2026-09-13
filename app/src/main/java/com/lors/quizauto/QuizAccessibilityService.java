@@ -32,9 +32,14 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final String TAG = "QuizAutoSvc";
 
     private static final long DEBOUNCE_MS = 150L;
-    private static final long ACTION_DELAY_MS = 400L;
-    private static final long NEXT_SCAN_DELAY_MS = 150L;
+    private static final long AFTER_ANSWER_CLICK_MS = 700L;    // было 400 — увеличили
+    private static final long AFTER_CHECK_RETRY_MS = 300L;     // ретрай "Проверить"
+    private static final long NEXT_SCAN_DELAY_MS = 200L;
+    private static final long P2_COOLDOWN_MS = 800L;           // не кликать "Далее" чаще этого
+
     private static final double QUESTION_THRESHOLD = 0.80;
+    private static final double SHORT_QUESTION_THRESHOLD = 0.68;
+    private static final int SHORT_QUESTION_LEN = 25;
     private static final double ANSWER_FUZZY = 0.88;
 
     private static final Set<String> UI_NOISE = new HashSet<>(Arrays.asList(
@@ -46,7 +51,13 @@ public class QuizAccessibilityService extends AccessibilityService {
             "новая игра",
             "закрыть",
             "победа",
-            "ваша награда"
+            "ваша награда",
+            "загрузка завершена",
+            "загрузка",
+            "пополните энергию чтобы сыграть",
+            "пополните энергию",
+            "нет энергии",
+            "нет попыток"
     ));
 
     private static final Set<String> NEVER_CLICK = new HashSet<>(Arrays.asList(
@@ -69,7 +80,13 @@ public class QuizAccessibilityService extends AccessibilityService {
     private String lastSavedQuestionId = "";
     private long lastSavedQuestionTime = 0L;
 
-    /** Хелпер: пишет и в Logcat, и в файл. */
+    // Анти-дубликат для клика по ответу
+    private String lastAnsweredQuestion = "";
+    private long lastAnsweredTime = 0L;
+
+    // Анти-спам "Далее"
+    private long lastNextClickTime = 0L;
+
     private void log(String msg) {
         Log.i(TAG, msg);
         LocalStore.appendLog(this, msg);
@@ -78,11 +95,6 @@ public class QuizAccessibilityService extends AccessibilityService {
     private void logW(String msg) {
         Log.w(TAG, msg);
         LocalStore.appendLog(this, "WARN: " + msg);
-    }
-
-    private void logE(String msg) {
-        Log.e(TAG, msg);
-        LocalStore.appendLog(this, "ERROR: " + msg);
     }
 
     @Override
@@ -127,15 +139,15 @@ public class QuizAccessibilityService extends AccessibilityService {
     public void reloadQuestions() {
         this.questions = LocalStore.loadQuestions(this);
         log("Loaded questions: " + questions.size());
-        if (questions.isEmpty()) {
-            logW("Question base is EMPTY. Sync from GitHub first.");
-        }
+        if (questions.isEmpty()) logW("Question base is EMPTY. Sync first.");
     }
 
     public void resetCycles() {
         cyclesDone = 0;
         cyclesLimit = LocalStore.getCyclesLimit(this);
         lastSavedQuestionId = "";
+        lastAnsweredQuestion = "";
+        lastNextClickTime = 0L;
         log("Cycles reset. Limit: " + cyclesLimit);
     }
 
@@ -184,6 +196,7 @@ public class QuizAccessibilityService extends AccessibilityService {
                         + (cyclesLimit > 0 ? "/" + cyclesLimit : " (inf)"));
 
                 lastSavedQuestionId = "";
+                lastAnsweredQuestion = "";
 
                 if (cyclesLimit > 0 && cyclesDone >= cyclesLimit) {
                     log("Cycle limit reached, stopping");
@@ -204,20 +217,19 @@ public class QuizAccessibilityService extends AccessibilityService {
                 return;
             }
 
-            // P2: экран результата
-            boolean onResultScreen =
-                    findFirstByText(nodes, 0.85, "Далее") != null
-                            || findFirstByText(nodes, 0.85, "Верно") != null
-                            || findFirstByText(nodes, 0.85, "Неправильно") != null;
-
-            if (onResultScreen) {
-                if (tryClickFirstByText(nodes, 0.85, "Далее")) {
-                    log("P2: click Далее");
-                    handler.postDelayed(() -> {
-                        isProcessing = false;
-                        handler.post(scanRunnable);
-                    }, NEXT_SCAN_DELAY_MS);
-                    return;
+            // P2: экран результата — только "Далее"
+            AccessibilityNodeInfo nextBtn = findFirstByText(nodes, 0.88, "Далее");
+            if (nextBtn != null) {
+                long now = System.currentTimeMillis();
+                if (now - lastNextClickTime > P2_COOLDOWN_MS) {
+                    lastNextClickTime = now;
+                    if (smartClick(nextBtn)) {
+                        log("P2: clicked Далее");
+                        handler.postDelayed(() -> {
+                            isProcessing = false;
+                            handler.post(scanRunnable);
+                        }, NEXT_SCAN_DELAY_MS);
+                    }
                 }
                 return;
             }
@@ -233,26 +245,31 @@ public class QuizAccessibilityService extends AccessibilityService {
     private void handleQuestionScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
         if (questions.isEmpty()) {
             reloadQuestions();
-            if (questions.isEmpty()) {
-                logW("Base empty, cannot match. Trying to save unknown anyway.");
-                saveUnknownQuestion(nodes);
-                return;
-            }
+            if (questions.isEmpty()) return;
         }
 
         List<String> visibleAnswers = collectVisibleAnswers(nodes);
         Question matched = findBestQuestionMatch(nodes, visibleAnswers);
 
         if (matched == null) {
-            log("No question match. Visible answers: " + visibleAnswers.size());
             saveUnknownQuestion(nodes);
             return;
         }
+
+        // Анти-дубликат: если мы уже отвечали на этот вопрос в последние 6 сек,
+        // значит викторина ещё не среагировала. Не отвечаем повторно.
+        String qId = QuestionMatcher.normalize(matched.getQuestion());
+        long now = System.currentTimeMillis();
+        if (qId.equals(lastAnsweredQuestion) && (now - lastAnsweredTime) < 6000L) {
+            return; // ждём реакции викторины
+        }
+
         log("Matched Q: " + matched.getQuestion());
 
         AccessibilityNodeInfo answerNode = findAnswerNode(nodes, matched.getAnswer());
         if (answerNode == null) {
-            logW("Answer node not found: " + matched.getAnswer());
+            logW("Answer node not found: " + matched.getAnswer()
+                    + " | visible: " + visibleAnswers);
             return;
         }
 
@@ -260,26 +277,49 @@ public class QuizAccessibilityService extends AccessibilityService {
             logW("Failed to click answer");
             return;
         }
+
+        lastAnsweredQuestion = qId;
+        lastAnsweredTime = now;
         log("Clicked answer: " + matched.getAnswer());
 
+        // Клик по "Проверить" — с ретраями
+        clickCheckWithRetry(0);
+    }
+
+    /**
+     * Пытается кликнуть "Проверить". Если кнопка не активна — повторяет
+     * до 3 раз с интервалом в 300 мс.
+     */
+    private void clickCheckWithRetry(int attempt) {
+        if (attempt > 3) {
+            logW("Проверить: gave up after 4 attempts");
+            return;
+        }
         handler.postDelayed(() -> {
             AccessibilityNodeInfo root2 = getRootInActiveWindow();
             if (root2 == null) return;
             List<AccessibilityNodeInfo> nodes2 = new ArrayList<>();
             collectNodes(root2, nodes2);
             AccessibilityNodeInfo checkBtn = findFirstByText(nodes2, 0.85, "Проверить");
-            if (checkBtn != null && checkBtn.isEnabled()) {
-                smartClick(checkBtn);
-                log("Clicked Проверить");
-            } else {
-                logW("Проверить not found or disabled");
+            if (checkBtn == null) {
+                logW("Проверить: not found (attempt " + attempt + ")");
+                clickCheckWithRetry(attempt + 1);
+                return;
             }
-        }, ACTION_DELAY_MS);
+            if (!checkBtn.isEnabled()) {
+                log("Проверить: disabled (attempt " + attempt + "), retrying");
+                clickCheckWithRetry(attempt + 1);
+                return;
+            }
+            if (smartClick(checkBtn)) {
+                log("Clicked Проверить (attempt " + attempt + ")");
+            } else {
+                logW("Проверить: smartClick failed (attempt " + attempt + ")");
+                clickCheckWithRetry(attempt + 1);
+            }
+        }, attempt == 0 ? AFTER_ANSWER_CLICK_MS : AFTER_CHECK_RETRY_MS);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // СБОР НЕИЗВЕСТНЫХ ВОПРОСОВ
-    // ─────────────────────────────────────────────────────────────
     private void saveUnknownQuestion(@NonNull List<AccessibilityNodeInfo> nodes) {
         List<String> allTexts = new ArrayList<>();
         for (AccessibilityNodeInfo n : nodes) {
@@ -292,11 +332,7 @@ public class QuizAccessibilityService extends AccessibilityService {
             allTexts.add(s);
         }
 
-        log("saveUnknown: total texts on screen = " + allTexts.size());
-        if (allTexts.isEmpty()) {
-            logW("saveUnknown: no texts on screen, skip");
-            return;
-        }
+        if (allTexts.isEmpty()) return;
 
         String questionCandidate = null;
         for (String s : allTexts) {
@@ -304,20 +340,19 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (UI_NOISE.contains(norm)) continue;
             if (s.matches("^\\d+$")) continue;
             if (s.length() < 8) continue;
+            if (norm.contains("загрузка")) continue;
+            if (norm.contains("энерг")) continue;
+            if (norm.contains("попытк")) continue;
             if (questionCandidate == null || s.length() > questionCandidate.length()) {
                 questionCandidate = s;
             }
         }
 
-        if (questionCandidate == null) {
-            logW("saveUnknown: no question candidate found. Texts: " + allTexts);
-            return;
-        }
+        if (questionCandidate == null) return;
 
         String qId = QuestionMatcher.normalize(questionCandidate);
         long now = System.currentTimeMillis();
         if (qId.equals(lastSavedQuestionId) && (now - lastSavedQuestionTime) < 5000L) {
-            log("saveUnknown: duplicate within 5s, skip");
             return;
         }
         lastSavedQuestionId = qId;
@@ -330,14 +365,14 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (UI_NOISE.contains(norm)) continue;
             if (s.matches("^\\d+$")) continue;
             if (s.length() > 100) continue;
+            if (norm.contains("загрузка")) continue;
+            if (norm.contains("энерг")) continue;
+            if (norm.contains("попытк")) continue;
             if (!variants.contains(s)) variants.add(s);
         }
 
-        log("SAVING UNKNOWN: Q=\"" + questionCandidate
-                + "\" | variants=" + variants.size());
-
+        log("SAVING: Q=\"" + questionCandidate + "\" | variants=" + variants.size());
         LocalStore.appendUnknown(this, questionCandidate, variants);
-        log("Unknown saved successfully");
     }
 
     @NonNull
@@ -366,14 +401,20 @@ public class QuizAccessibilityService extends AccessibilityService {
             CharSequence cs = n.getText();
             if (cs == null) continue;
             String candidate = cs.toString().trim();
-            if (candidate.length() < 10 || candidate.length() > 300) continue;
+            if (candidate.length() < 8 || candidate.length() > 300) continue;
             String norm = QuestionMatcher.normalize(candidate);
             if (UI_NOISE.contains(norm)) continue;
             if (candidate.matches("\\d+")) continue;
+            if (norm.contains("загрузка")) continue;
+            if (norm.contains("энерг")) continue;
+
+            double threshold = candidate.length() <= SHORT_QUESTION_LEN
+                    ? SHORT_QUESTION_THRESHOLD
+                    : QUESTION_THRESHOLD;
 
             for (Question q : questions) {
                 double s = QuestionMatcher.similarity(candidate, q.getQuestion());
-                if (s < QUESTION_THRESHOLD) continue;
+                if (s < threshold) continue;
 
                 boolean answerVisible = false;
                 for (String va : visibleAnswers) {
@@ -452,12 +493,6 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (best != null) return best;
         }
         return null;
-    }
-
-    private boolean tryClickFirstByText(@NonNull List<AccessibilityNodeInfo> nodes,
-                                        double threshold, String... texts) {
-        AccessibilityNodeInfo node = findFirstByText(nodes, threshold, texts);
-        return node != null && smartClick(node);
     }
 
     private boolean smartClick(@NonNull AccessibilityNodeInfo node) {
