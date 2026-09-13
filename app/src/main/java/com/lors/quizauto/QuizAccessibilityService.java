@@ -32,10 +32,10 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final String TAG = "QuizAutoSvc";
 
     private static final long DEBOUNCE_MS = 150L;
-    private static final long AFTER_ANSWER_CLICK_MS = 700L;    // было 400 — увеличили
-    private static final long AFTER_CHECK_RETRY_MS = 300L;     // ретрай "Проверить"
+    private static final long AFTER_ANSWER_CLICK_MS = 600L;
+    private static final long AFTER_CHECK_RETRY_MS = 300L;
     private static final long NEXT_SCAN_DELAY_MS = 200L;
-    private static final long P2_COOLDOWN_MS = 800L;           // не кликать "Далее" чаще этого
+    private static final long P2_COOLDOWN_MS = 800L;
 
     private static final double QUESTION_THRESHOLD = 0.80;
     private static final double SHORT_QUESTION_THRESHOLD = 0.68;
@@ -80,11 +80,9 @@ public class QuizAccessibilityService extends AccessibilityService {
     private String lastSavedQuestionId = "";
     private long lastSavedQuestionTime = 0L;
 
-    // Анти-дубликат для клика по ответу
     private String lastAnsweredQuestion = "";
     private long lastAnsweredTime = 0L;
 
-    // Анти-спам "Далее"
     private long lastNextClickTime = 0L;
 
     private void log(String msg) {
@@ -256,12 +254,10 @@ public class QuizAccessibilityService extends AccessibilityService {
             return;
         }
 
-        // Анти-дубликат: если мы уже отвечали на этот вопрос в последние 6 сек,
-        // значит викторина ещё не среагировала. Не отвечаем повторно.
         String qId = QuestionMatcher.normalize(matched.getQuestion());
         long now = System.currentTimeMillis();
         if (qId.equals(lastAnsweredQuestion) && (now - lastAnsweredTime) < 6000L) {
-            return; // ждём реакции викторины
+            return;
         }
 
         log("Matched Q: " + matched.getQuestion());
@@ -282,14 +278,9 @@ public class QuizAccessibilityService extends AccessibilityService {
         lastAnsweredTime = now;
         log("Clicked answer: " + matched.getAnswer());
 
-        // Клик по "Проверить" — с ретраями
         clickCheckWithRetry(0);
     }
 
-    /**
-     * Пытается кликнуть "Проверить". Если кнопка не активна — повторяет
-     * до 3 раз с интервалом в 300 мс.
-     */
     private void clickCheckWithRetry(int attempt) {
         if (attempt > 3) {
             logW("Проверить: gave up after 4 attempts");
@@ -334,6 +325,8 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         if (allTexts.isEmpty()) return;
 
+        // Ищем вопрос: сначала пробуем найти текст с "?"
+        // Если несколько — берём самый длинный
         String questionCandidate = null;
         for (String s : allTexts) {
             String norm = QuestionMatcher.normalize(s);
@@ -343,8 +336,26 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (norm.contains("загрузка")) continue;
             if (norm.contains("энерг")) continue;
             if (norm.contains("попытк")) continue;
+            // Только строки с "?" считаем вопросами
+            if (!s.contains("?")) continue;
             if (questionCandidate == null || s.length() > questionCandidate.length()) {
                 questionCandidate = s;
+            }
+        }
+
+        // Если не нашли с "?" — берём самый длинный текст (запасной вариант)
+        if (questionCandidate == null) {
+            for (String s : allTexts) {
+                String norm = QuestionMatcher.normalize(s);
+                if (UI_NOISE.contains(norm)) continue;
+                if (s.matches("^\\d+$")) continue;
+                if (s.length() < 8) continue;
+                if (norm.contains("загрузка")) continue;
+                if (norm.contains("энерг")) continue;
+                if (norm.contains("попытк")) continue;
+                if (questionCandidate == null || s.length() > questionCandidate.length()) {
+                    questionCandidate = s;
+                }
             }
         }
 
@@ -495,6 +506,9 @@ public class QuizAccessibilityService extends AccessibilityService {
         return null;
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // ЖЕЛЕЗОБЕТОННЫЙ КЛИК: всегда через gesture по координатам
+    // ─────────────────────────────────────────────────────────────
     private boolean smartClick(@NonNull AccessibilityNodeInfo node) {
         CharSequence cs = node.getText();
         if (cs != null && NEVER_CLICK.contains(QuestionMatcher.normalize(cs.toString()))) {
@@ -502,20 +516,60 @@ public class QuizAccessibilityService extends AccessibilityService {
             return false;
         }
 
-        AccessibilityNodeInfo cur = node;
-        int depth = 0;
-        while (cur != null && depth < 6) {
-            if (cur.isClickable()) {
-                if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+        // 1) Пытаемся найти координаты кликабельного элемента
+        Rect rect = new Rect();
+
+        // Сначала пробуем boundsInScreen самого узла
+        node.getBoundsInScreen(rect);
+        if (rect.width() <= 0 || rect.height() <= 0) {
+            // Если узел невидим — идём к родителям
+            AccessibilityNodeInfo cur = node.getParent();
+            int depth = 0;
+            while (cur != null && depth < 6) {
+                cur.getBoundsInScreen(rect);
+                if (rect.width() > 0 && rect.height() > 0) break;
+                cur = cur.getParent();
+                depth++;
             }
-            cur = cur.getParent();
-            depth++;
         }
 
-        Rect rect = new Rect();
-        node.getBoundsInScreen(rect);
-        if (rect.width() <= 0 || rect.height() <= 0) return false;
-        return tapAt(rect.exactCenterX(), rect.exactCenterY());
+        if (rect.width() <= 0 || rect.height() > 0) {
+            // Пробуем performAction как последний шанс
+            AccessibilityNodeInfo cur = node;
+            int depth = 0;
+            while (cur != null && depth < 6) {
+                if (cur.isClickable()) {
+                    if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        return true;
+                    }
+                }
+                cur = cur.getParent();
+                depth++;
+            }
+            return false;
+        }
+
+        // 2) Всегда кликаем по координатам
+        float x = rect.exactCenterX();
+        float y = rect.exactCenterY();
+        boolean ok = tapAt(x, y);
+
+        // 3) Если gesture не сработал — пробуем performAction как запасной вариант
+        if (!ok) {
+            AccessibilityNodeInfo cur = node;
+            int depth = 0;
+            while (cur != null && depth < 6) {
+                if (cur.isClickable()) {
+                    if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        return true;
+                    }
+                }
+                cur = cur.getParent();
+                depth++;
+            }
+        }
+
+        return ok;
     }
 
     private boolean tapAt(float x, float y) {
@@ -523,7 +577,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         Path p = new Path();
         p.moveTo(x, y);
         GestureDescription.StrokeDescription stroke =
-                new GestureDescription.StrokeDescription(p, 0L, 40L);
+                new GestureDescription.StrokeDescription(p, 0L, 50L);
         GestureDescription gesture = new GestureDescription.Builder()
                 .addStroke(stroke)
                 .build();
