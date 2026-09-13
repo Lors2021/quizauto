@@ -35,17 +35,14 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final long AFTER_ANSWER_CLICK_MS = 600L;
     private static final long AFTER_CHECK_RETRY_MS = 300L;
     private static final long NEXT_SCAN_DELAY_MS = 200L;
-    private static final long P2_COOLDOWN_MS = 800L;
+    private static final long P2_COOLDOWN_MS = 500L;
 
-    // ⏱ Задержка перед первым кликом — даём викторине отрисовать варианты
     private static final long FIRST_SEEN_TO_CLICK_MS = 450L;
-    // Через сколько считать вопрос "новым"
-    private static final long QUESTION_FRESH_MS = 3500L;
-    // Блокировка повтора ответа на тот же вопрос
     private static final long ANSWER_COOLDOWN_MS = 3000L;
-
-    // Автоперезагрузка базы
     private static final long BASE_RELOAD_INTERVAL_MS = 5000L;
+
+    // 🆕 Не чаще раза в 1.2 сек писать диагностику "неизвестного экрана"
+    private static final long UNKNOWN_SCREEN_LOG_COOLDOWN_MS = 1200L;
 
     private static final double QUESTION_THRESHOLD = 0.80;
     private static final double SHORT_QUESTION_THRESHOLD = 0.68;
@@ -93,20 +90,18 @@ public class QuizAccessibilityService extends AccessibilityService {
     private String lastAnsweredQuestion = "";
     private long lastAnsweredTime = 0L;
 
-    // 🆕 Отслеживание "свежего" вопроса — чтобы не кликать сразу
     private String currentQuestionId = "";
     private long currentQuestionFirstSeen = 0L;
 
     private long lastNextClickTime = 0L;
     private long lastBaseReloadTime = 0L;
+    private long lastUnknownScreenLog = 0L;
 
     private final Runnable baseReloader = new Runnable() {
         @Override
         public void run() {
             if (!sRunning) return;
-            if (questions.isEmpty()) {
-                reloadQuestions();
-            }
+            if (questions.isEmpty()) reloadQuestions();
             handler.postDelayed(this, BASE_RELOAD_INTERVAL_MS);
         }
     };
@@ -132,8 +127,6 @@ public class QuizAccessibilityService extends AccessibilityService {
         cyclesDone = 0;
         acquireWakeLock();
         log("Cycles limit: " + cyclesLimit);
-
-        // Автоперезагрузка базы, если она пустая
         handler.removeCallbacks(baseReloader);
         handler.postDelayed(baseReloader, BASE_RELOAD_INTERVAL_MS);
     }
@@ -258,7 +251,6 @@ public class QuizAccessibilityService extends AccessibilityService {
                     lastNextClickTime = now;
                     if (smartClick(nextBtn)) {
                         log("P2: clicked Далее");
-                        // Сбрасываем "текущий вопрос" — новый будет другим
                         currentQuestionId = "";
                         handler.postDelayed(() -> {
                             isProcessing = false;
@@ -270,57 +262,88 @@ public class QuizAccessibilityService extends AccessibilityService {
             }
 
             // P3: экран вопроса
-            handleQuestionScreen(nodes);
+            boolean handled = handleQuestionScreen(nodes);
+
+            // 🆕 Диагностика: если ни P1, ни P2, ни P3 не сработали —
+            //     пишем, что видим на экране
+            if (!handled) {
+                logUnknownScreen(nodes);
+            }
 
         } finally {
             handler.postDelayed(() -> isProcessing = false, 100L);
         }
     }
 
-    private void handleQuestionScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
+    /**
+     * 🆕 Диагностика: пишет тексты на экране, когда ничего не сработало.
+     * Пишется не чаще раза в UNKNOWN_SCREEN_LOG_COOLDOWN_MS.
+     */
+    private void logUnknownScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
+        long now = System.currentTimeMillis();
+        if (now - lastUnknownScreenLog < UNKNOWN_SCREEN_LOG_COOLDOWN_MS) return;
+        lastUnknownScreenLog = now;
+
+        List<String> texts = new ArrayList<>();
+        for (AccessibilityNodeInfo n : nodes) {
+            CharSequence cs = n.getText();
+            if (cs == null) cs = n.getContentDescription();
+            if (cs == null) continue;
+            String s = cs.toString().trim();
+            if (s.isEmpty()) continue;
+            if (s.length() > 80) s = s.substring(0, 80) + "…";
+            if (!texts.contains(s)) texts.add(s);
+        }
+        log("UNKNOWN SCREEN. Texts: " + texts);
+    }
+
+    /**
+     * Возвращает true, если экран был распознан как экран вопроса
+     * (неважно — ответили или нет).
+     */
+    private boolean handleQuestionScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
         if (questions.isEmpty()) {
             reloadQuestions();
-            if (questions.isEmpty()) return;
+            if (questions.isEmpty()) return false;
         }
 
         List<String> visibleAnswers = collectVisibleAnswers(nodes);
         Question matched = findBestQuestionMatch(nodes, visibleAnswers);
 
         if (matched == null) {
-            saveUnknownQuestion(nodes);
-            return;
+            // Если видим признаки экрана вопроса, но матч не удался — сохраняем
+            if (visibleAnswers.size() >= 2) {
+                saveUnknownQuestion(nodes);
+                return true; // был экран вопроса, просто неизвестный
+            }
+            return false;
         }
 
         String qId = QuestionMatcher.normalize(matched.getQuestion());
         long now = System.currentTimeMillis();
 
-        // 🆕 Отслеживаем "свежий вопрос" — не кликаем сразу после появления
         if (!qId.equals(currentQuestionId)) {
-            // Первый раз видим этот вопрос
             currentQuestionId = qId;
             currentQuestionFirstSeen = now;
             log("Fresh Q detected: " + matched.getQuestion());
-            // Не кликаем — подождём следующего скана
             handler.postDelayed(() -> {
                 isProcessing = false;
                 handler.post(scanRunnable);
             }, FIRST_SEEN_TO_CLICK_MS);
-            return;
+            return true;
         }
 
-        // Если вопрос "свежий" — ждём, пока пройдёт FIRST_SEEN_TO_CLICK_MS
         if (now - currentQuestionFirstSeen < FIRST_SEEN_TO_CLICK_MS) {
             log("Q still fresh, waiting " + (FIRST_SEEN_TO_CLICK_MS - (now - currentQuestionFirstSeen)) + "ms");
             handler.postDelayed(() -> {
                 isProcessing = false;
                 handler.post(scanRunnable);
             }, FIRST_SEEN_TO_CLICK_MS - (now - currentQuestionFirstSeen) + 50L);
-            return;
+            return true;
         }
 
-        // Анти-дубликат: если мы уже отвечали на этот вопрос в последние 3 сек — пропускаем
         if (qId.equals(lastAnsweredQuestion) && (now - lastAnsweredTime) < ANSWER_COOLDOWN_MS) {
-            return;
+            return true;
         }
 
         log("Matched Q: " + matched.getQuestion());
@@ -329,12 +352,12 @@ public class QuizAccessibilityService extends AccessibilityService {
         if (answerNode == null) {
             logW("Answer node not found: " + matched.getAnswer()
                     + " | visible: " + visibleAnswers);
-            return;
+            return true;
         }
 
         if (!smartClick(answerNode)) {
             logW("Failed to click answer");
-            return;
+            return true;
         }
 
         lastAnsweredQuestion = qId;
@@ -342,6 +365,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         log("Clicked answer: " + matched.getAnswer());
 
         clickCheckWithRetry(0);
+        return true;
     }
 
     private void clickCheckWithRetry(int attempt) {
@@ -388,7 +412,6 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         if (allTexts.isEmpty()) return;
 
-        // 1) Ищем вопросы со знаком "?"
         String questionCandidate = null;
         for (String s : allTexts) {
             String norm = QuestionMatcher.normalize(s);
@@ -404,11 +427,7 @@ public class QuizAccessibilityService extends AccessibilityService {
             }
         }
 
-        // 2) Если вопроса с "?" нет — не сохраняем вообще.
-        //    Служебные строки типа "Выберите правильный ответ" — мусор.
-        if (questionCandidate == null) {
-            return;
-        }
+        if (questionCandidate == null) return;
 
         String qId = QuestionMatcher.normalize(questionCandidate);
         long now = System.currentTimeMillis();
@@ -580,9 +599,7 @@ public class QuizAccessibilityService extends AccessibilityService {
             int depth = 0;
             while (cur != null && depth < 6) {
                 if (cur.isClickable()) {
-                    if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                        return true;
-                    }
+                    if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
                 }
                 cur = cur.getParent();
                 depth++;
@@ -599,9 +616,7 @@ public class QuizAccessibilityService extends AccessibilityService {
             int depth = 0;
             while (cur != null && depth < 6) {
                 if (cur.isClickable()) {
-                    if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                        return true;
-                    }
+                    if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
                 }
                 cur = cur.getParent();
                 depth++;
