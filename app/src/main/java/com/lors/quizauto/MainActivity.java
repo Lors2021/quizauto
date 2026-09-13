@@ -1,5 +1,8 @@
 package com.lors.quizauto;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
@@ -7,6 +10,8 @@ import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.View;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.Nullable;
@@ -58,11 +63,13 @@ public class MainActivity extends AppCompatActivity {
         MaterialButton btnOverlaySettings = findViewById(R.id.btnOverlaySettings);
         MaterialButton btnAccessSettings = findViewById(R.id.btnAccessSettings);
         MaterialButton btnToggleOverlay = findViewById(R.id.btnToggleOverlay);
+        MaterialButton btnUnknown = findViewById(R.id.btnUnknown);
 
         btnSync.setOnClickListener(v -> syncFromGithub());
         btnOverlaySettings.setOnClickListener(v -> openOverlayPermission());
         btnAccessSettings.setOnClickListener(v -> openAccessibilitySettings());
         btnToggleOverlay.setOnClickListener(v -> toggleOverlay());
+        btnUnknown.setOnClickListener(v -> showUnknown());
 
         cardOverlay.setOnClickListener(v -> openOverlayPermission());
         cardAccessibility.setOnClickListener(v -> openAccessibilitySettings());
@@ -186,6 +193,51 @@ public class MainActivity extends AppCompatActivity {
                 });
             }
         });
+    }
+
+    // 🆕 Показать неизвестные вопросы
+    private void showUnknown() {
+        String data = LocalStore.loadUnknown(this);
+        if (data.isEmpty()) {
+            Toast.makeText(this, "Пока ничего не собрано", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // Скроллируемое поле с текстом
+        ScrollView scroll = new ScrollView(this);
+        TextView tv = new TextView(this);
+        tv.setText(data);
+        tv.setTextSize(12);
+        tv.setPadding(32, 32, 32, 32);
+        tv.setTextIsSelectable(true);
+        scroll.addView(tv);
+
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("Неизвестные вопросы (" + countRecords(data) + ")")
+                .setView(scroll)
+                .setPositiveButton("Копировать всё", (d, w) -> {
+                    ClipboardManager cm = (ClipboardManager)
+                            getSystemService(Context.CLIPBOARD_SERVICE);
+                    cm.setPrimaryClip(ClipData.newPlainText("unknown", data));
+                    Toast.makeText(this, "Скопировано в буфер обмена",
+                            Toast.LENGTH_SHORT).show();
+                })
+                .setNeutralButton("Очистить", (d, w) -> {
+                    LocalStore.clearUnknown(this);
+                    Toast.makeText(this, "Очищено", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Закрыть", null)
+                .show();
+    }
+
+    private int countRecords(String data) {
+        int count = 0;
+        int idx = 0;
+        while ((idx = data.indexOf("ВОПРОС:", idx)) != -1) {
+            count++;
+            idx += 7;
+        }
+        return count;
     }
 
     @Override
