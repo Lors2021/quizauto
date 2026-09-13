@@ -66,19 +66,36 @@ public class QuizAccessibilityService extends AccessibilityService {
 
     private PowerManager.WakeLock wakeLock;
 
-    // ID последнего записанного вопроса — чтобы не дублировать в одном показе
     private String lastSavedQuestionId = "";
     private long lastSavedQuestionTime = 0L;
+
+    /** Хелпер: пишет и в Logcat, и в файл. */
+    private void log(String msg) {
+        Log.i(TAG, msg);
+        LocalStore.appendLog(this, msg);
+    }
+
+    private void logW(String msg) {
+        Log.w(TAG, msg);
+        LocalStore.appendLog(this, "WARN: " + msg);
+    }
+
+    private void logE(String msg) {
+        Log.e(TAG, msg);
+        LocalStore.appendLog(this, "ERROR: " + msg);
+    }
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         sInstance = this;
-        Log.i(TAG, "AccessibilityService connected");
+        LocalStore.appendLog(this, "\n\n========== SERVICE CONNECTED ==========");
+        log("Service connected");
         reloadQuestions();
         cyclesLimit = LocalStore.getCyclesLimit(this);
         cyclesDone = 0;
         acquireWakeLock();
+        log("Cycles limit: " + cyclesLimit);
     }
 
     @Override
@@ -87,6 +104,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         sRunning = false;
         handler.removeCallbacksAndMessages(null);
         releaseWakeLock();
+        log("Service disconnected");
         return super.onUnbind(intent);
     }
 
@@ -108,14 +126,17 @@ public class QuizAccessibilityService extends AccessibilityService {
 
     public void reloadQuestions() {
         this.questions = LocalStore.loadQuestions(this);
-        Log.i(TAG, "Loaded questions: " + questions.size());
+        log("Loaded questions: " + questions.size());
+        if (questions.isEmpty()) {
+            logW("Question base is EMPTY. Sync from GitHub first.");
+        }
     }
 
     public void resetCycles() {
         cyclesDone = 0;
         cyclesLimit = LocalStore.getCyclesLimit(this);
         lastSavedQuestionId = "";
-        Log.i(TAG, "Cycles reset. Limit: " + cyclesLimit);
+        log("Cycles reset. Limit: " + cyclesLimit);
     }
 
     private void acquireWakeLock() {
@@ -128,8 +149,9 @@ public class QuizAccessibilityService extends AccessibilityService {
                     "QuizAuto::screenWake");
             wakeLock.setReferenceCounted(false);
             wakeLock.acquire(4 * 60 * 60 * 1000L);
+            log("WakeLock acquired");
         } catch (Exception e) {
-            Log.w(TAG, "WakeLock failed: " + e.getMessage());
+            logW("WakeLock failed: " + e.getMessage());
         }
     }
 
@@ -137,6 +159,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         try {
             if (wakeLock != null && wakeLock.isHeld()) {
                 wakeLock.release();
+                log("WakeLock released");
             }
         } catch (Exception ignored) {}
         wakeLock = null;
@@ -152,19 +175,18 @@ public class QuizAccessibilityService extends AccessibilityService {
             List<AccessibilityNodeInfo> nodes = new ArrayList<>();
             collectNodes(root, nodes);
 
-            // ─── P1: победа ───
+            // P1: победа
             AccessibilityNodeInfo restartBtn = findFirstByText(nodes, 0.85,
                     "Новая игра", "Заново", "Играть заново");
             if (restartBtn != null) {
                 cyclesDone++;
-                Log.i(TAG, "P1: cycle done. Total: " + cyclesDone
-                        + (cyclesLimit > 0 ? "/" + cyclesLimit : " (∞)"));
+                log("P1: cycle done. Total: " + cyclesDone
+                        + (cyclesLimit > 0 ? "/" + cyclesLimit : " (inf)"));
 
-                // Сбрасываем защиту от дубликата — новый цикл
                 lastSavedQuestionId = "";
 
                 if (cyclesLimit > 0 && cyclesDone >= cyclesLimit) {
-                    Log.i(TAG, "Cycle limit reached, stopping");
+                    log("Cycle limit reached, stopping");
                     final int done = cyclesDone;
                     handler.post(() -> {
                         sRunning = false;
@@ -178,13 +200,11 @@ public class QuizAccessibilityService extends AccessibilityService {
                     return;
                 }
 
-                if (smartClick(restartBtn)) {
-                    Log.i(TAG, "P1: clicked Новая игра");
-                }
+                if (smartClick(restartBtn)) log("P1: clicked Новая игра");
                 return;
             }
 
-            // ─── P2: экран результата ───
+            // P2: экран результата
             boolean onResultScreen =
                     findFirstByText(nodes, 0.85, "Далее") != null
                             || findFirstByText(nodes, 0.85, "Верно") != null
@@ -192,7 +212,7 @@ public class QuizAccessibilityService extends AccessibilityService {
 
             if (onResultScreen) {
                 if (tryClickFirstByText(nodes, 0.85, "Далее")) {
-                    Log.i(TAG, "P2: click Далее");
+                    log("P2: click Далее");
                     handler.postDelayed(() -> {
                         isProcessing = false;
                         handler.post(scanRunnable);
@@ -202,7 +222,7 @@ public class QuizAccessibilityService extends AccessibilityService {
                 return;
             }
 
-            // ─── P3: экран вопроса ───
+            // P3: экран вопроса
             handleQuestionScreen(nodes);
 
         } finally {
@@ -214,8 +234,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         if (questions.isEmpty()) {
             reloadQuestions();
             if (questions.isEmpty()) {
-                Log.w(TAG, "No questions loaded, cannot match. Did you sync?");
-                // Всё равно попробуем сохранить вопрос — база может быть пустой
+                logW("Base empty, cannot match. Trying to save unknown anyway.");
                 saveUnknownQuestion(nodes);
                 return;
             }
@@ -225,23 +244,23 @@ public class QuizAccessibilityService extends AccessibilityService {
         Question matched = findBestQuestionMatch(nodes, visibleAnswers);
 
         if (matched == null) {
-            Log.i(TAG, "No question match — trying to save unknown");
+            log("No question match. Visible answers: " + visibleAnswers.size());
             saveUnknownQuestion(nodes);
             return;
         }
-        Log.i(TAG, "Matched Q: " + matched.getQuestion());
+        log("Matched Q: " + matched.getQuestion());
 
         AccessibilityNodeInfo answerNode = findAnswerNode(nodes, matched.getAnswer());
         if (answerNode == null) {
-            Log.w(TAG, "Answer node not found: " + matched.getAnswer());
+            logW("Answer node not found: " + matched.getAnswer());
             return;
         }
 
         if (!smartClick(answerNode)) {
-            Log.w(TAG, "Failed to click answer");
+            logW("Failed to click answer");
             return;
         }
-        Log.i(TAG, "Clicked answer: " + matched.getAnswer());
+        log("Clicked answer: " + matched.getAnswer());
 
         handler.postDelayed(() -> {
             AccessibilityNodeInfo root2 = getRootInActiveWindow();
@@ -251,18 +270,17 @@ public class QuizAccessibilityService extends AccessibilityService {
             AccessibilityNodeInfo checkBtn = findFirstByText(nodes2, 0.85, "Проверить");
             if (checkBtn != null && checkBtn.isEnabled()) {
                 smartClick(checkBtn);
-                Log.i(TAG, "Clicked Проверить");
+                log("Clicked Проверить");
             } else {
-                Log.w(TAG, "Проверить not found or disabled");
+                logW("Проверить not found or disabled");
             }
         }, ACTION_DELAY_MS);
     }
 
     // ─────────────────────────────────────────────────────────────
-    // СБОР НЕИЗВЕСТНЫХ ВОПРОСОВ (упрощённая, агрессивная версия)
+    // СБОР НЕИЗВЕСТНЫХ ВОПРОСОВ
     // ─────────────────────────────────────────────────────────────
     private void saveUnknownQuestion(@NonNull List<AccessibilityNodeInfo> nodes) {
-        // 1) Собираем ВСЕ тексты с экрана
         List<String> allTexts = new ArrayList<>();
         for (AccessibilityNodeInfo n : nodes) {
             CharSequence cs = n.getText();
@@ -274,42 +292,37 @@ public class QuizAccessibilityService extends AccessibilityService {
             allTexts.add(s);
         }
 
-        Log.d(TAG, "saveUnknown: total texts on screen = " + allTexts.size());
-
+        log("saveUnknown: total texts on screen = " + allTexts.size());
         if (allTexts.isEmpty()) {
-            Log.w(TAG, "saveUnknown: no texts on screen, skip");
+            logW("saveUnknown: no texts on screen, skip");
             return;
         }
 
-        // 2) Ищем самый длинный текст — это вопрос
-        //    Не фильтруем по UI_NOISE — пусть попадёт что угодно.
         String questionCandidate = null;
         for (String s : allTexts) {
             String norm = QuestionMatcher.normalize(s);
-            if (UI_NOISE.contains(norm)) continue; // служебные — мимо
-            if (s.matches("^\\d+$")) continue;     // "27", "180"
-            if (s.length() < 8) continue;          // слишком короткое
+            if (UI_NOISE.contains(norm)) continue;
+            if (s.matches("^\\d+$")) continue;
+            if (s.length() < 8) continue;
             if (questionCandidate == null || s.length() > questionCandidate.length()) {
                 questionCandidate = s;
             }
         }
 
         if (questionCandidate == null) {
-            Log.w(TAG, "saveUnknown: no question candidate found");
+            logW("saveUnknown: no question candidate found. Texts: " + allTexts);
             return;
         }
 
-        // 3) Защита от дубликата (один и тот же вопрос не сохраняем в течение 5 сек)
         String qId = QuestionMatcher.normalize(questionCandidate);
         long now = System.currentTimeMillis();
         if (qId.equals(lastSavedQuestionId) && (now - lastSavedQuestionTime) < 5000L) {
-            Log.d(TAG, "saveUnknown: duplicate within 5s, skip");
+            log("saveUnknown: duplicate within 5s, skip");
             return;
         }
         lastSavedQuestionId = qId;
         lastSavedQuestionTime = now;
 
-        // 4) Собираем варианты — все тексты, кроме вопроса и служебных
         List<String> variants = new ArrayList<>();
         for (String s : allTexts) {
             if (s.equals(questionCandidate)) continue;
@@ -320,11 +333,11 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (!variants.contains(s)) variants.add(s);
         }
 
-        Log.i(TAG, "SAVING UNKNOWN: Q=\"" + questionCandidate
+        log("SAVING UNKNOWN: Q=\"" + questionCandidate
                 + "\" | variants=" + variants.size());
 
-        // 5) Пишем в файл
         LocalStore.appendUnknown(this, questionCandidate, variants);
+        log("Unknown saved successfully");
     }
 
     @NonNull
@@ -450,7 +463,7 @@ public class QuizAccessibilityService extends AccessibilityService {
     private boolean smartClick(@NonNull AccessibilityNodeInfo node) {
         CharSequence cs = node.getText();
         if (cs != null && NEVER_CLICK.contains(QuestionMatcher.normalize(cs.toString()))) {
-            Log.w(TAG, "Blocked click: " + cs);
+            logW("Blocked click: " + cs);
             return false;
         }
 
