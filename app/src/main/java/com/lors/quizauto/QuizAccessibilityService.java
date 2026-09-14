@@ -124,7 +124,6 @@ public class QuizAccessibilityService extends AccessibilityService {
                 log("hb: isProcessing=" + isProcessing);
             }
 
-            // Если isProcessing застряло дольше 2 секунд — сбрасываем принудительно
             if (isProcessing && (now - lastScreenChangeTime) > 2000L) {
                 log("hb: force-reset isProcessing (stuck)");
                 isProcessing = false;
@@ -332,7 +331,16 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         if (texts.isEmpty()) return;
 
-        String signature = String.join("|", texts);
+        // Signature БЕЗ чисел — чтобы таймер не сбивал
+        StringBuilder sigBuilder = new StringBuilder();
+        for (String s : texts) {
+            if (s.matches("^\\d+$")) continue;
+            if (s.matches("^\\d+°$")) continue;
+            if (s.matches("^\\d+°.*")) continue;
+            sigBuilder.append(s).append("|");
+        }
+        String signature = sigBuilder.toString();
+
         long now = System.currentTimeMillis();
 
         if (!signature.equals(lastScreenSignature)) {
@@ -492,9 +500,6 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (UI_NOISE.contains(norm)) continue;
             if (s.matches("^\\d+$")) continue;
             if (s.length() < 8) continue;
-            if (norm.contains("загрузка")) continue;
-            if (norm.contains("энерг")) continue;
-            if (norm.contains("попытк")) continue;
             if (!s.contains("?")) continue;
             if (questionCandidate == null || s.length() > questionCandidate.length()) {
                 questionCandidate = s;
@@ -518,9 +523,6 @@ public class QuizAccessibilityService extends AccessibilityService {
             if (UI_NOISE.contains(norm)) continue;
             if (s.matches("^\\d+$")) continue;
             if (s.length() > 100) continue;
-            if (norm.contains("загрузка")) continue;
-            if (norm.contains("энерг")) continue;
-            if (norm.contains("попытк")) continue;
             if (!variants.contains(s)) variants.add(s);
         }
 
@@ -558,8 +560,6 @@ public class QuizAccessibilityService extends AccessibilityService {
             String norm = QuestionMatcher.normalize(candidate);
             if (UI_NOISE.contains(norm)) continue;
             if (candidate.matches("\\d+")) continue;
-            if (norm.contains("загрузка")) continue;
-            if (norm.contains("энерг")) continue;
 
             double threshold = candidate.length() <= SHORT_QUESTION_LEN
                     ? SHORT_QUESTION_THRESHOLD
