@@ -42,8 +42,8 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final long BASE_RELOAD_INTERVAL_MS = 5000L;
     private static final long HEARTBEAT_INTERVAL_MS = 700L;
 
-    private static final long STUCK_THRESHOLD_MS = 2500L;
-    private static final long STUCK_LOG_COOLDOWN_MS = 3000L;
+    private static final long STUCK_THRESHOLD_MS = 1500L;
+    private static final long STUCK_LOG_COOLDOWN_MS = 1500L;
 
     private static final double QUESTION_THRESHOLD = 0.80;
     private static final double SHORT_QUESTION_THRESHOLD = 0.68;
@@ -117,11 +117,17 @@ public class QuizAccessibilityService extends AccessibilityService {
         public void run() {
             if (!sRunning) return;
 
-            // 🆕 Логируем heartbeat раз в 5 секунд
             long now = System.currentTimeMillis();
+
             if (now - lastHeartbeatLogTime > 5000L) {
                 lastHeartbeatLogTime = now;
                 log("hb: isProcessing=" + isProcessing);
+            }
+
+            // Если isProcessing застряло дольше 2 секунд — сбрасываем принудительно
+            if (isProcessing && (now - lastScreenChangeTime) > 2000L) {
+                log("hb: force-reset isProcessing (stuck)");
+                isProcessing = false;
             }
 
             if (!isProcessing) {
@@ -237,7 +243,6 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         AccessibilityNodeInfo root = getRootInActiveWindow();
 
-        // 🆕 Логируем, если root == null — вот причина пропусков
         if (root == null) {
             long now = System.currentTimeMillis();
             if (now - lastRootNullLogTime > 3000L) {
@@ -308,6 +313,7 @@ public class QuizAccessibilityService extends AccessibilityService {
             handleQuestionScreen(nodes);
 
         } finally {
+            isProcessing = false;
             handler.postDelayed(() -> isProcessing = false, 100L);
         }
     }
@@ -332,6 +338,10 @@ public class QuizAccessibilityService extends AccessibilityService {
         if (!signature.equals(lastScreenSignature)) {
             lastScreenSignature = signature;
             lastScreenChangeTime = now;
+            if (now - lastStuckLogTime > 3000L) {
+                lastStuckLogTime = now;
+                log("SCREEN CHANGED. Texts: " + texts);
+            }
             return;
         }
 
