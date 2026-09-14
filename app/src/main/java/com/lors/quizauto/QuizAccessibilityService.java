@@ -42,7 +42,6 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final long BASE_RELOAD_INTERVAL_MS = 5000L;
     private static final long HEARTBEAT_INTERVAL_MS = 700L;
 
-    // 🆕 Диагностика "застоя" — если на одном экране > 2.5 сек — пишем, что там
     private static final long STUCK_THRESHOLD_MS = 2500L;
     private static final long STUCK_LOG_COOLDOWN_MS = 3000L;
 
@@ -97,10 +96,12 @@ public class QuizAccessibilityService extends AccessibilityService {
 
     private long lastNextClickTime = 0L;
 
-    // 🆕 Отслеживание "застоя" — последний виденный набор текстов + время
     private String lastScreenSignature = "";
     private long lastScreenChangeTime = 0L;
     private long lastStuckLogTime = 0L;
+
+    private long lastHeartbeatLogTime = 0L;
+    private long lastRootNullLogTime = 0L;
 
     private final Runnable baseReloader = new Runnable() {
         @Override
@@ -115,6 +116,14 @@ public class QuizAccessibilityService extends AccessibilityService {
         @Override
         public void run() {
             if (!sRunning) return;
+
+            // 🆕 Логируем heartbeat раз в 5 секунд
+            long now = System.currentTimeMillis();
+            if (now - lastHeartbeatLogTime > 5000L) {
+                lastHeartbeatLogTime = now;
+                log("hb: isProcessing=" + isProcessing);
+            }
+
             if (!isProcessing) {
                 handler.removeCallbacks(scanRunnable);
                 handler.post(scanRunnable);
@@ -225,16 +234,24 @@ public class QuizAccessibilityService extends AccessibilityService {
 
     private void runStateMachine() {
         if (!sRunning || isProcessing) return;
+
         AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
+
+        // 🆕 Логируем, если root == null — вот причина пропусков
+        if (root == null) {
+            long now = System.currentTimeMillis();
+            if (now - lastRootNullLogTime > 3000L) {
+                lastRootNullLogTime = now;
+                log("root == null — Accessibility не видит активное окно");
+            }
+            return;
+        }
 
         isProcessing = true;
         try {
             List<AccessibilityNodeInfo> nodes = new ArrayList<>();
             collectNodes(root, nodes);
 
-            // 🆕 Диагностика "застоя": если тексты не меняются дольше STUCK_THRESHOLD_MS —
-            //     пишем что видим, вне зависимости от того, что решит state machine
             maybeLogStuckScreen(nodes);
 
             // P1: победа
@@ -295,10 +312,6 @@ public class QuizAccessibilityService extends AccessibilityService {
         }
     }
 
-    /**
-     * 🆕 Если экран не меняется дольше STUCK_THRESHOLD_MS — пишем подробный дамп.
-     * Это позволяет понять, что происходит когда сервис "стоит" на вопросе.
-     */
     private void maybeLogStuckScreen(@NonNull List<AccessibilityNodeInfo> nodes) {
         List<String> texts = new ArrayList<>();
         for (AccessibilityNodeInfo n : nodes) {
@@ -322,14 +335,12 @@ public class QuizAccessibilityService extends AccessibilityService {
             return;
         }
 
-        // Экран не менялся
         long stuckFor = now - lastScreenChangeTime;
         if (stuckFor < STUCK_THRESHOLD_MS) return;
         if (now - lastStuckLogTime < STUCK_LOG_COOLDOWN_MS) return;
 
         lastStuckLogTime = now;
 
-        // Диагностика: какие вопросы из базы близки к текстам на экране?
         List<String> nearMatches = new ArrayList<>();
         for (String s : texts) {
             if (s.length() < 8 || s.length() > 300) continue;
@@ -349,7 +360,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         if (!nearMatches.isEmpty()) {
             log("STUCK near-matches: " + nearMatches);
         } else {
-            log("STUCK: no near-matches in base. Have you added this Q?");
+            log("STUCK: no near-matches in base.");
         }
     }
 
@@ -424,7 +435,11 @@ public class QuizAccessibilityService extends AccessibilityService {
         }
         handler.postDelayed(() -> {
             AccessibilityNodeInfo root2 = getRootInActiveWindow();
-            if (root2 == null) return;
+            if (root2 == null) {
+                logW("Проверить: root null (attempt " + attempt + ")");
+                clickCheckWithRetry(attempt + 1);
+                return;
+            }
             List<AccessibilityNodeInfo> nodes2 = new ArrayList<>();
             collectNodes(root2, nodes2);
             AccessibilityNodeInfo checkBtn = findFirstByText(nodes2, 0.85, "Проверить");
