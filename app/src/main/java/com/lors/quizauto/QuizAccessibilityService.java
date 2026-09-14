@@ -32,8 +32,6 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final String TAG = "QuizAutoSvc";
 
     private static final long DEBOUNCE_MS = 150L;
-    private static final long AFTER_ANSWER_CLICK_MS = 600L;
-    private static final long AFTER_CHECK_RETRY_MS = 300L;
     private static final long NEXT_SCAN_DELAY_MS = 200L;
     private static final long P2_COOLDOWN_MS = 500L;
 
@@ -41,9 +39,10 @@ public class QuizAccessibilityService extends AccessibilityService {
     private static final long ANSWER_COOLDOWN_MS = 3000L;
     private static final long BASE_RELOAD_INTERVAL_MS = 5000L;
     private static final long HEARTBEAT_INTERVAL_MS = 700L;
+    private static final long AFTER_ANSWER_VERIFY_MS = 1500L;
 
     private static final long STUCK_THRESHOLD_MS = 1500L;
-    private static final long STUCK_LOG_COOLDOWN_MS = 1500L;
+    private static final long STUCK_LOG_COOLDOWN_MS = 3000L;
 
     private static final double QUESTION_THRESHOLD = 0.80;
     private static final double SHORT_QUESTION_THRESHOLD = 0.68;
@@ -331,11 +330,9 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         if (texts.isEmpty()) return;
 
-        // Signature БЕЗ чисел — чтобы таймер не сбивал
         StringBuilder sigBuilder = new StringBuilder();
         for (String s : texts) {
             if (s.matches("^\\d+$")) continue;
-            if (s.matches("^\\d+°$")) continue;
             if (s.matches("^\\d+°.*")) continue;
             sigBuilder.append(s).append("|");
         }
@@ -346,10 +343,7 @@ public class QuizAccessibilityService extends AccessibilityService {
         if (!signature.equals(lastScreenSignature)) {
             lastScreenSignature = signature;
             lastScreenChangeTime = now;
-            if (now - lastStuckLogTime > 3000L) {
-                lastStuckLogTime = now;
-                log("SCREEN CHANGED. Texts: " + texts);
-            }
+            lastStuckLogTime = now;
             return;
         }
 
@@ -392,6 +386,31 @@ public class QuizAccessibilityService extends AccessibilityService {
         Question matched = findBestQuestionMatch(nodes, visibleAnswers);
 
         if (matched == null) {
+            // Диагностика: если похоже на экран вопроса, но матч не удался — пишем что видели
+            List<String> candidates = new ArrayList<>();
+            for (AccessibilityNodeInfo n : nodes) {
+                CharSequence cs = n.getText();
+                if (cs == null) continue;
+                String s = cs.toString().trim();
+                if (s.length() < 8 || s.length() > 300) continue;
+                if (!s.contains("?")) continue;
+                String norm = QuestionMatcher.normalize(s);
+                if (UI_NOISE.contains(norm)) continue;
+
+                double bestSim = 0.0;
+                String bestQ = "";
+                for (Question q : questions) {
+                    double sim = QuestionMatcher.similarity(s, q.getQuestion());
+                    if (sim > bestSim) {
+                        bestSim = sim;
+                        bestQ = q.getQuestion();
+                    }
+                }
+                candidates.add(String.format("[%.2f] \"%s\" ~ \"%s\"", bestSim, s, bestQ));
+            }
+            if (!candidates.isEmpty()) {
+                log("NO MATCH but Q-like texts: " + candidates);
+            }
             if (visibleAnswers.size() >= 2) {
                 saveUnknownQuestion(nodes);
             }
@@ -443,41 +462,43 @@ public class QuizAccessibilityService extends AccessibilityService {
         lastAnsweredTime = now;
         log("Clicked answer: " + matched.getAnswer());
 
-        clickCheckWithRetry(0);
+        verifyAndClickCheck(0, matched.getAnswer());
     }
 
-    private void clickCheckWithRetry(int attempt) {
-        if (attempt > 3) {
-            logW("Проверить: gave up after 4 attempts");
+    private void verifyAndClickCheck(int attempt, @NonNull String expectedAnswer) {
+        if (attempt > 2) {
+            logW("verify: gave up after 3 attempts");
             return;
         }
+
         handler.postDelayed(() -> {
-            AccessibilityNodeInfo root2 = getRootInActiveWindow();
-            if (root2 == null) {
-                logW("Проверить: root null (attempt " + attempt + ")");
-                clickCheckWithRetry(attempt + 1);
-                return;
-            }
-            List<AccessibilityNodeInfo> nodes2 = new ArrayList<>();
-            collectNodes(root2, nodes2);
-            AccessibilityNodeInfo checkBtn = findFirstByText(nodes2, 0.85, "Проверить");
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root == null) return;
+            List<AccessibilityNodeInfo> nodes = new ArrayList<>();
+            collectNodes(root, nodes);
+
+            AccessibilityNodeInfo checkBtn = findFirstByText(nodes, 0.85, "Проверить");
             if (checkBtn == null) {
-                logW("Проверить: not found (attempt " + attempt + ")");
-                clickCheckWithRetry(attempt + 1);
+                logW("verify: Проверить not found");
                 return;
             }
-            if (!checkBtn.isEnabled()) {
-                log("Проверить: disabled (attempt " + attempt + "), retrying");
-                clickCheckWithRetry(attempt + 1);
+
+            if (checkBtn.isEnabled()) {
+                if (smartClick(checkBtn)) {
+                    log("Clicked Проверить (verify attempt " + attempt + ")");
+                }
                 return;
             }
-            if (smartClick(checkBtn)) {
-                log("Clicked Проверить (attempt " + attempt + ")");
-            } else {
-                logW("Проверить: smartClick failed (attempt " + attempt + ")");
-                clickCheckWithRetry(attempt + 1);
+
+            log("verify: Проверить disabled — retrying answer click");
+
+            AccessibilityNodeInfo answerNode = findAnswerNode(nodes, expectedAnswer);
+            if (answerNode != null && smartClick(answerNode)) {
+                log("verify: re-clicked answer: " + expectedAnswer);
             }
-        }, attempt == 0 ? AFTER_ANSWER_CLICK_MS : AFTER_CHECK_RETRY_MS);
+
+            verifyAndClickCheck(attempt + 1, expectedAnswer);
+        }, AFTER_ANSWER_VERIFY_MS);
     }
 
     private void saveUnknownQuestion(@NonNull List<AccessibilityNodeInfo> nodes) {
@@ -657,6 +678,7 @@ public class QuizAccessibilityService extends AccessibilityService {
 
         Rect rect = new Rect();
         node.getBoundsInScreen(rect);
+
         if (rect.width() <= 0 || rect.height() <= 0) {
             AccessibilityNodeInfo cur = node.getParent();
             int depth = 0;
@@ -669,34 +691,13 @@ public class QuizAccessibilityService extends AccessibilityService {
         }
 
         if (rect.width() <= 0 || rect.height() <= 0) {
-            AccessibilityNodeInfo cur = node;
-            int depth = 0;
-            while (cur != null && depth < 6) {
-                if (cur.isClickable()) {
-                    if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
-                }
-                cur = cur.getParent();
-                depth++;
-            }
+            logW("smartClick: zero bounds");
             return false;
         }
 
         float x = rect.exactCenterX();
         float y = rect.exactCenterY();
-        boolean ok = tapAt(x, y);
-
-        if (!ok) {
-            AccessibilityNodeInfo cur = node;
-            int depth = 0;
-            while (cur != null && depth < 6) {
-                if (cur.isClickable()) {
-                    if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
-                }
-                cur = cur.getParent();
-                depth++;
-            }
-        }
-        return ok;
+        return tapAt(x, y);
     }
 
     private boolean tapAt(float x, float y) {
